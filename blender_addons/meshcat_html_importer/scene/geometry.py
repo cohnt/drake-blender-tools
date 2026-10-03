@@ -62,9 +62,9 @@ class PrimitiveGeometry:
 
 @dataclass
 class MeshFileGeometry:
-    """A geometry loaded from an embedded mesh file (glTF, OBJ)."""
+    """A geometry loaded from an embedded mesh file (glTF, OBJ, Collada)."""
 
-    format: str  # "gltf" or "obj"
+    format: str  # "gltf", "glb", "obj" or "dae"
     data: bytes
     resources: dict[str, bytes] = field(default_factory=dict)
 
@@ -215,7 +215,7 @@ def _parse_meshfile_geometry(
     geom_data: dict[str, Any],
     cas_assets: dict[str, str | bytes] | None = None,
 ) -> MeshFileGeometry | None:
-    """Parse a _meshfile_geometry (embedded glTF/OBJ).
+    """Parse a _meshfile_geometry (embedded glTF/OBJ/Collada).
 
     Args:
         geom_data: Geometry data dictionary

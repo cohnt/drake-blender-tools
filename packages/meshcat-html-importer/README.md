@@ -15,7 +15,7 @@ with full animation support.
 - Support for multiple geometry types:
   - `BufferGeometry` (custom meshes)
   - Primitives: `BoxGeometry`, `SphereGeometry`, `CylinderGeometry`
-  - Mesh files: glTF, OBJ (embedded in `_meshfile_geometry`)
+  - Mesh files: glTF, OBJ, Collada .dae (embedded in `_meshfile_geometry`)
 - Material conversion (Three.js → Blender Principled BSDF)
 - Animation import with keyframe conversion
 - Scene hierarchy preservation
@@ -95,4 +95,9 @@ Meshcat HTML recordings contain:
 ### Geometry
 - Positions, normals, UVs, and indices from BufferGeometry
 - Procedural primitives (box, sphere, cylinder)
-- Embedded glTF/OBJ mesh files
+- Embedded glTF/OBJ/Collada mesh files
+- Collada (.dae) meshes are read by a built-in reader that reproduces what
+  Meshcat shows: geometry and node transforms only, colored with the Drake
+  Rgba. Like Meshcat, it ignores `<unit>`, `<up_axis>`, Collada materials
+  and vertex colors, and skips `<polygons>`, lines and skinned meshes (with
+  a printed warning).

@@ -449,7 +449,7 @@ def _create_object_from_node(
     # We want to extract the model name
     obj_name = _derive_object_name(node.path)
 
-    # Check if this is a mesh file (glTF/OBJ) - these are handled specially
+    # Check if this is a mesh file (glTF/OBJ/Collada) - these are handled specially
     is_meshfile = isinstance(node.geometry, MeshFileGeometry)
     is_gltf = is_meshfile and node.geometry.format.lower() in ("gltf", "glb")
 
@@ -468,8 +468,10 @@ def _create_object_from_node(
 
     # Apply material for non-glTF geometry.
     # glTF imports have their own embedded materials, but OBJ files may not
-    # (they depend on MTL files which may be missing). For OBJ meshfile geometry
-    # and non-meshfile geometry, apply materials from the scene graph.
+    # (they depend on MTL files which may be missing). For OBJ and Collada
+    # meshfile geometry and non-meshfile geometry, apply materials from the scene
+    # graph. For Collada this is the Drake Rgba, which is also what Meshcat
+    # shows: it ignores the file's own materials and vertex colors.
     if not is_gltf:
         if node.material is not None:
             mat_name = f"{node.name}_material"
