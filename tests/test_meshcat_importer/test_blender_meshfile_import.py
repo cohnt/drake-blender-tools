@@ -281,6 +281,85 @@ class TestBlenderMeshfileImport:
         assert corner_normals[0] == pytest.approx((0.0, 0.0, -1.0), abs=1e-4)
         assert corner_normals[9] == pytest.approx((0.57735, 0.57735, 0.57735), abs=1e-4)
 
+    def test_dae_keeps_per_corner_normals_uvs_and_both_sides(self):
+        """Every corner keeps its own normal and UV, in triangle order.
+
+        The two triangles use the same vertices with opposite winding, as in a
+        double-sided export. Meshcat draws both, so both are kept.
+        """
+        normals = np.array(
+            [[0, 0, 1], [0, 0.6, 0.8], [0.6, 0, 0.8],
+             [0, 0, -1], [0, -0.6, -0.8], [-0.6, 0, -0.8]]
+        )  # fmt: skip
+        uvs = np.array([[0, 0], [1, 0], [0, 1], [0.5, 0.5], [0.25, 0.75], [1, 1]])
+        flat = " ".join(f"{v}" for v in normals.ravel())
+        flat_uvs = " ".join(f"{v}" for v in uvs.ravel())
+        dae = f"""<?xml version="1.0" encoding="UTF-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset><up_axis>Y_UP</up_axis></asset>
+  <library_geometries>
+    <geometry id="sheet">
+      <mesh>
+        <source id="pos">
+          <float_array id="pos-array">0 0 0  1 0 0  0 1 0</float_array>
+          <technique_common>
+            <accessor source="#pos-array" stride="3"/>
+          </technique_common>
+        </source>
+        <source id="nrm">
+          <float_array id="nrm-array">{flat}</float_array>
+          <technique_common>
+            <accessor source="#nrm-array" stride="3"/>
+          </technique_common>
+        </source>
+        <source id="uv">
+          <float_array id="uv-array">{flat_uvs}</float_array>
+          <technique_common>
+            <accessor source="#uv-array" stride="2"/>
+          </technique_common>
+        </source>
+        <vertices id="verts"><input semantic="POSITION" source="#pos"/></vertices>
+        <triangles count="2">
+          <input offset="0" semantic="VERTEX" source="#verts"/>
+          <input offset="1" semantic="NORMAL" source="#nrm"/>
+          <input offset="2" semantic="TEXCOORD" source="#uv" set="0"/>
+          <p>0 0 0  1 1 1  2 2 2  0 3 3  2 4 4  1 5 5</p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+  <library_visual_scenes>
+    <visual_scene id="scene">
+      <node><instance_geometry url="#sheet"/></node>
+    </visual_scene>
+  </library_visual_scenes>
+  <scene><instance_visual_scene url="#scene"/></scene>
+</COLLADA>
+"""
+        node = SceneNode(
+            path="/sheet",
+            name="sheet",
+            geometry=MeshFileGeometry(format="dae", data=dae.encode("utf-8")),
+        )
+
+        obj, _ = create_mesh_file_object(node, name="sheet")
+
+        mesh = obj.data
+        assert len(mesh.polygons) == 2
+        corner_positions = [
+            tuple(mesh.vertices[lp.vertex_index].co) for lp in mesh.loops
+        ]
+        np.testing.assert_allclose(
+            corner_positions,
+            [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 0), (0, 1, 0), (1, 0, 0)],
+        )
+        np.testing.assert_allclose(
+            [tuple(n.vector) for n in mesh.corner_normals], normals, atol=1e-3
+        )
+        np.testing.assert_allclose(
+            [tuple(d.uv) for d in mesh.uv_layers["UVMap"].data], uvs, atol=1e-6
+        )
+
     def test_dae_object_matches_obj_object(self):
         """A dae and an OBJ of the same vertices land in the same place.
 
@@ -325,7 +404,7 @@ class TestBlenderMeshfileImport:
             (0.8, 0.098, 0.098), abs=1e-3
         )
 
-    def test_dae_unit_and_up_axis_ignored_like_meshcat(self):
+    def test_dae_unit_and_up_axis_ignored_like_meshcat(self, capsys):
         """<unit> and Z_UP do not change the imported geometry."""
         reference_node = SceneNode(
             path="/a", name="a", geometry=_make_collada_geometry()
@@ -345,6 +424,10 @@ class TestBlenderMeshfileImport:
             [tuple(v.co) for v in variant.data.vertices],
             [tuple(v.co) for v in reference.data.vertices],
         )
+        # Ignoring them is intended, so it is a note, not a warning.
+        out = capsys.readouterr().out
+        assert "Note: Collada mesh for /b" in out
+        assert "Warning" not in out
 
     def test_unsupported_format_warns(self, capsys):
         """Formats the importer cannot read are reported, not silently dropped."""

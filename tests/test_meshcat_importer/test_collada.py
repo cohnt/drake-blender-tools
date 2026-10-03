@@ -80,15 +80,15 @@ def _collada(
     geometries: str,
     nodes: str,
     asset: str = "<up_axis>Y_UP</up_axis>",
-    library_nodes: str = "",
+    libraries: str = "",
 ) -> bytes:
     """Wrap geometries and visual-scene nodes into a Collada 1.4.1 document."""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
   <asset>{asset}</asset>
   <library_images/>
+  {libraries}
   <library_geometries>{geometries}</library_geometries>
-  {library_nodes}
   <library_visual_scenes>
     <visual_scene id="scene" name="scene">{nodes}</visual_scene>
   </library_visual_scenes>
@@ -97,9 +97,16 @@ def _collada(
 """.encode("utf-8")
 
 
-def _corner_positions(mesh) -> np.ndarray:
-    """Positions of every triangle corner, in triangle order."""
+def _corners(mesh) -> np.ndarray:
+    """Positions of every triangle corner, in the order Meshcat draws them."""
     return mesh.positions[mesh.triangles.ravel()]
+
+
+TRI_CORNERS = np.array(
+    [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 0], [0, 1, 0], [0, 0, 1]]
+)
+INSTANCE_TRI = '<node><instance_geometry url="#tri-lib"/></node>'
+INSTANCE_POLY = '<node><instance_geometry url="#poly-lib"/></node>'
 
 
 class TestColladaParsing:
@@ -107,15 +114,12 @@ class TestColladaParsing:
 
     def test_triangles_with_interleaved_inputs(self):
         """VERTEX/COLOR/NORMAL offsets are followed; COLOR is not used."""
-        mesh = parse_collada(
-            _collada(
-                TRIANGLE_GEOMETRY, '<node><instance_geometry url="#tri-lib"/></node>'
-            )
-        )
+        mesh = parse_collada(_collada(TRIANGLE_GEOMETRY, INSTANCE_TRI))
 
         assert mesh.warnings == []
-        assert mesh.positions.shape == (4, 3)
-        assert mesh.triangles.tolist() == [[0, 1, 2], [0, 2, 3]]
+        assert mesh.notes == []
+        assert len(mesh.positions) == 4
+        np.testing.assert_allclose(_corners(mesh), TRI_CORNERS)
         np.testing.assert_allclose(
             mesh.corner_normals, [[0, 0, 1]] * 3 + [[1, 0, 0]] * 3
         )
@@ -123,55 +127,73 @@ class TestColladaParsing:
 
     def test_polylist_triangulated_like_colladaloader(self):
         """Quads split as (0,1,3),(1,2,3); larger polygons fan from corner 0."""
-        mesh = parse_collada(
-            _collada(
-                POLYLIST_GEOMETRY, '<node><instance_geometry url="#poly-lib"/></node>'
-            )
-        )
+        mesh = parse_collada(_collada(POLYLIST_GEOMETRY, INSTANCE_POLY))
 
         expected_corners = [0, 1, 3, 1, 2, 3, 4, 5, 6, 4, 6, 7, 4, 7, 8]
         positions = np.array(
             [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [2, 0, 0], [3, 0, 0],
              [3, 1, 0], [2.5, 2, 0], [2, 1, 0]]
         )  # fmt: skip
-        np.testing.assert_allclose(_corner_positions(mesh), positions[expected_corners])
-        assert len(mesh.triangles) == 5
-        # No NORMAL input, so Blender computes normals.
+        np.testing.assert_allclose(_corners(mesh), positions[expected_corners])
+        # No NORMAL input, so Blender computes (flat) normals, as Meshcat does.
         assert mesh.corner_normals is None
         np.testing.assert_allclose(mesh.corner_uvs, [[0.25, 0.75]] * 15)
 
-    def test_several_geometries_are_merged(self):
+    def test_geometries_with_matching_attributes_are_merged(self):
         """Every instanced geometry ends up in the one merged mesh."""
+        other = TRIANGLE_GEOMETRY.replace("tri-", "tri2-")
+        nodes = INSTANCE_TRI + (
+            '<node><translate>0 0 5</translate><instance_geometry url="#tri2-lib"/>'
+            "</node>"
+        )
+        mesh = parse_collada(_collada(TRIANGLE_GEOMETRY + other, nodes))
+
+        np.testing.assert_allclose(
+            _corners(mesh), np.r_[TRI_CORNERS, TRI_CORNERS + [0, 0, 5]]
+        )
+        assert mesh.warnings == []
+
+    def test_mismatched_attributes_show_nothing(self):
+        """Meshcat cannot merge meshes with and without normals; it shows nothing."""
         mesh = parse_collada(
             _collada(
-                TRIANGLE_GEOMETRY + POLYLIST_GEOMETRY,
-                '<node><instance_geometry url="#tri-lib"/></node>'
-                '<node><instance_geometry url="#poly-lib"/></node>',
+                TRIANGLE_GEOMETRY + POLYLIST_GEOMETRY, INSTANCE_TRI + INSTANCE_POLY
             )
         )
 
-        assert len(mesh.triangles) == 2 + 5
-        assert len(mesh.positions) == 4 + 9
-        # Only one geometry has normals, so normals are left to Blender.
-        assert mesh.corner_normals is None
-        # UVs of the geometry without UVs are zero, as in ColladaLoader.
-        np.testing.assert_allclose(mesh.corner_uvs[:6], 0.0)
-        np.testing.assert_allclose(mesh.corner_uvs[6:], [[0.25, 0.75]] * 15)
-        assert any("NORMAL" in w for w in mesh.warnings)
+        assert len(mesh.triangles) == 0
+        assert any("cannot merge" in w for w in mesh.warnings)
 
-    def test_unused_and_degenerate_data_dropped(self):
-        """Unreferenced vertices and zero-area triangles are not kept."""
+    def test_degenerate_triangles_dropped(self):
+        """Zero-area triangles draw nothing and are not kept."""
         geometry = TRIANGLE_GEOMETRY.replace(
             "<p>0 0 0  1 0 0  2 0 0  0 0 1  2 0 1  3 0 1</p>",
             "<p>0 0 0  1 0 0  2 0 0  1 0 1  1 0 1  2 0 1</p>",
         )
-        mesh = parse_collada(
-            _collada(geometry, '<node><instance_geometry url="#tri-lib"/></node>')
-        )
+        mesh = parse_collada(_collada(geometry, INSTANCE_TRI))
 
-        assert mesh.triangles.tolist() == [[0, 1, 2]]
+        np.testing.assert_allclose(_corners(mesh), TRI_CORNERS[:3])
         assert len(mesh.positions) == 3
         assert len(mesh.corner_normals) == 3
+
+    def test_short_data_shifts_later_corners(self):
+        """A missing <p> entry pushes nothing, so later corners move up a slot."""
+        geometry = POLYLIST_GEOMETRY.replace(
+            "<vcount>4 5</vcount>", "<vcount>3 3</vcount>"
+        ).replace(
+            "<p>0 0 1 0 2 0 3 0  4 0 5 0 6 0 7 0 8 0</p>", "<p>0 0 1 0 2 0 3 0 4 0</p>"
+        )
+        mesh = parse_collada(_collada(geometry, INSTANCE_POLY))
+
+        # Only 5 of the 6 corners exist, so only the first triangle is drawn.
+        np.testing.assert_allclose(_corners(mesh), [[0, 0, 0], [1, 0, 0], [1, 1, 0]])
+
+    def test_numbers_parsed_like_javascript(self):
+        """Tokens such as "-1.#IND00" or "0.5f" read as parseFloat reads them."""
+        geometry = POLYLIST_GEOMETRY.replace("2.5 2 0", "2.5f 2 -0.#IND00")
+        mesh = parse_collada(_collada(geometry, INSTANCE_POLY))
+
+        assert [2.5, 2, -0.0] in _corners(mesh).tolist()
 
     def test_invalid_xml_returns_empty_mesh(self):
         """Malformed files give an empty mesh and a warning, not an exception."""
@@ -200,36 +222,76 @@ class TestColladaTransforms:
         mesh = parse_collada(_collada(TRIANGLE_GEOMETRY, nodes))
 
         # local p -> translate(1,2,3) @ Rz(90) @ scale(2) @ (p + (0.5, 0, 0))
-        def expected(p):
-            x, y, z = 2 * (np.array(p) + [0.5, 0, 0])
-            return np.array([-y, x, z]) + [1, 2, 3]
-
-        np.testing.assert_allclose(
-            mesh.positions,
-            [expected(p) for p in ([0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1])],
-            atol=1e-12,
-        )
+        x, y, z = (2 * (TRI_CORNERS + [0.5, 0, 0])).T
+        expected = np.c_[-y, x, z] + [1, 2, 3]
+        np.testing.assert_allclose(_corners(mesh), expected, atol=1e-12)
         # Normals rotate with the node; uniform scale does not change them.
         np.testing.assert_allclose(mesh.corner_normals[0], [0, 0, 1], atol=1e-12)
         np.testing.assert_allclose(mesh.corner_normals[3], [0, 1, 0], atol=1e-12)
 
+    def test_shared_geometry_transforms_accumulate(self):
+        """A geometry instanced twice is drawn twice at the product of both
+        transforms: three.js shares the geometry and merge_geometries transforms
+        it in place once per instance."""
+        nodes = """
+        <node><translate>1 0 0</translate><instance_geometry url="#tri-lib"/></node>
+        <node><translate>0 0 5</translate><instance_geometry url="#tri-lib"/></node>
+        """
+        mesh = parse_collada(_collada(TRIANGLE_GEOMETRY, nodes))
+
+        shifted = TRI_CORNERS + [1, 0, 5]
+        np.testing.assert_allclose(_corners(mesh), np.r_[shifted, shifted])
+
     def test_instance_node(self):
-        """instance_node pulls in a library node under the instancing node."""
-        library_nodes = """
+        """instance_node places a copy of a library node under the instancing node.
+
+        Next to other content, the copy keeps its own transform.
+        """
+        library = """
         <library_nodes>
-          <node id="part"><instance_geometry url="#tri-lib"/></node>
+          <node id="part">
+            <translate>0 0 5</translate>
+            <instance_geometry url="#tri-lib"/>
+          </node>
         </library_nodes>
         """
         nodes = """
-        <node><instance_node url="#part"/></node>
-        <node><translate>5 0 0</translate><instance_node url="#part"/></node>
+        <node>
+          <translate>1 0 0</translate>
+          <instance_node url="#part"/>
+          <instance_geometry url="#tri2-lib"/>
+        </node>
         """
-        mesh = parse_collada(
-            _collada(TRIANGLE_GEOMETRY, nodes, library_nodes=library_nodes)
+        geometries = TRIANGLE_GEOMETRY + TRIANGLE_GEOMETRY.replace("tri-", "tri2-")
+        mesh = parse_collada(_collada(geometries, nodes, libraries=library))
+
+        # ColladaLoader adds instance_geometry objects before instance_node copies.
+        np.testing.assert_allclose(
+            _corners(mesh), np.r_[TRI_CORNERS + [1, 0, 0], TRI_CORNERS + [1, 0, 5]]
         )
 
-        assert len(mesh.triangles) == 4
-        np.testing.assert_allclose(mesh.positions[4:], mesh.positions[:4] + [5, 0, 0])
+    def test_lone_instance_node_takes_the_instancing_transform(self):
+        """When an instance_node is a node's only content, ColladaLoader uses the
+        instanced copy as the node itself, replacing its transform."""
+        library = """
+        <library_nodes>
+          <node id="part">
+            <translate>0 0 5</translate>
+            <instance_geometry url="#tri-lib"/>
+          </node>
+        </library_nodes>
+        """
+        nodes = '<node><translate>1 0 0</translate><instance_node url="#part"/></node>'
+        mesh = parse_collada(_collada(TRIANGLE_GEOMETRY, nodes, libraries=library))
+
+        np.testing.assert_allclose(_corners(mesh), TRI_CORNERS + [1, 0, 0])
+
+    def test_short_matrix_draws_nothing(self):
+        """A <matrix> with too few values gives NaN in three.js: nothing drawn."""
+        nodes = '<node><matrix>1 0 0</matrix><instance_geometry url="#tri-lib"/></node>'
+        mesh = parse_collada(_collada(TRIANGLE_GEOMETRY, nodes))
+
+        assert len(mesh.triangles) == 0
 
     @pytest.mark.parametrize(
         "asset",
@@ -240,41 +302,78 @@ class TestColladaTransforms:
     )
     def test_unit_and_up_axis_ignored_like_meshcat(self, asset):
         """Meshcat applies neither <unit> nor <up_axis>, so neither do we."""
-        nodes = '<node><instance_geometry url="#tri-lib"/></node>'
-        reference = parse_collada(_collada(TRIANGLE_GEOMETRY, nodes))
-        mesh = parse_collada(_collada(TRIANGLE_GEOMETRY, nodes, asset=asset))
+        reference = parse_collada(_collada(TRIANGLE_GEOMETRY, INSTANCE_TRI))
+        mesh = parse_collada(_collada(TRIANGLE_GEOMETRY, INSTANCE_TRI, asset=asset))
 
         np.testing.assert_allclose(mesh.positions, reference.positions)
         np.testing.assert_allclose(mesh.corner_normals, reference.corner_normals)
-        assert any("<unit" in w for w in mesh.warnings)
-        assert any("<up_axis>" in w for w in mesh.warnings)
+        assert mesh.warnings == []
+        assert any("<unit" in n for n in mesh.notes)
+        assert any("<up_axis>" in n for n in mesh.notes)
 
     def test_unit_of_one_meter_is_silent(self):
         """A unit of one meter and Y_UP match Meshcat with nothing to report."""
         mesh = parse_collada(
             _collada(
                 TRIANGLE_GEOMETRY,
-                '<node><instance_geometry url="#tri-lib"/></node>',
+                INSTANCE_TRI,
                 asset='<unit meter="1" name="meter"/><up_axis>Y_UP</up_axis>',
             )
         )
 
         assert mesh.warnings == []
+        assert mesh.notes == []
+
+
+SKIN_CONTROLLER = """
+<library_controllers>
+  <controller id="skin">
+    <skin source="#tri-lib">
+      <source id="joints"><Name_array id="joints-array">root</Name_array></source>
+      <source id="weights"><float_array id="weights-array">1</float_array></source>
+      <source id="bind">
+        <float_array id="bind-array">1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1</float_array>
+        <technique_common>
+          <accessor source="#bind-array" stride="16"/>
+        </technique_common>
+      </source>
+      <joints>
+        <input semantic="JOINT" source="#joints"/>
+        <input semantic="INV_BIND_MATRIX" source="#bind"/>
+      </joints>
+      <vertex_weights count="4">
+        <input semantic="JOINT" source="#joints" offset="0"/>
+        <input semantic="WEIGHT" source="#weights" offset="1"/>
+        <vcount>1 1 1 1</vcount>
+        <v>0 0 0 0 0 0 0 0</v>
+      </vertex_weights>
+    </skin>
+  </controller>
+</library_controllers>
+"""
 
 
 class TestColladaSkipped:
     """Content Meshcat does not draw is skipped with a warning."""
 
-    def test_instance_controller_skipped(self):
-        """Skinned meshes are dropped, as merge_geometries ignores SkinnedMesh."""
+    def test_skinned_mesh_skipped(self):
+        """Skinned meshes are dropped, as merge_geometries ignores SkinnedMesh.
+
+        That includes a skinned geometry instanced with <instance_geometry>.
+        """
         nodes = """
         <node><instance_controller url="#skin"/></node>
         <node><instance_geometry url="#tri-lib"/></node>
+        <node><instance_geometry url="#poly-lib"/></node>
         """
-        mesh = parse_collada(_collada(TRIANGLE_GEOMETRY, nodes))
+        mesh = parse_collada(
+            _collada(
+                TRIANGLE_GEOMETRY + POLYLIST_GEOMETRY, nodes, libraries=SKIN_CONTROLLER
+            )
+        )
 
-        assert len(mesh.triangles) == 2
-        assert any("instance_controller" in w for w in mesh.warnings)
+        assert len(mesh.triangles) == 5
+        assert any("skinned" in w for w in mesh.warnings)
 
     def test_polygons_skipped(self):
         """<polygons> is unsupported by ColladaLoader and is skipped."""
@@ -286,9 +385,7 @@ class TestColladaSkipped:
               <p>0 1 2 3</p>
             </polygons>""",
         )
-        mesh = parse_collada(
-            _collada(geometry, '<node><instance_geometry url="#poly-lib"/></node>')
-        )
+        mesh = parse_collada(_collada(geometry, INSTANCE_POLY))
 
         assert len(mesh.triangles) == 5
         assert any("<polygons>" in w for w in mesh.warnings)
@@ -298,9 +395,33 @@ class TestColladaSkipped:
         geometry = POLYLIST_GEOMETRY.replace("polylist", "polygons").replace(
             "<vcount>4 5</vcount>", ""
         )
-        mesh = parse_collada(
-            _collada(geometry, '<node><instance_geometry url="#poly-lib"/></node>')
-        )
+        mesh = parse_collada(_collada(geometry, INSTANCE_POLY))
 
         assert len(mesh.triangles) == 0
         assert any("no triangle geometry" in w for w in mesh.warnings)
+
+    @pytest.mark.parametrize(
+        "libraries, nodes",
+        [
+            # A material whose effect is missing makes three.js throw.
+            (
+                '<library_materials><material id="m"><instance_effect url="#e"/>'
+                "</material></library_materials>",
+                INSTANCE_TRI,
+            ),
+            # So does an instanced morph controller.
+            (
+                '<library_controllers><controller id="morph"><morph source="#tri-lib"/>'
+                "</controller></library_controllers>",
+                '<node><instance_controller url="#morph"/></node>' + INSTANCE_TRI,
+            ),
+            # And a reference to a geometry that does not exist.
+            ("", '<node><instance_geometry url="#missing"/></node>' + INSTANCE_TRI),
+        ],
+    )
+    def test_files_meshcat_fails_on_give_empty_mesh(self, libraries, nodes):
+        """Where Meshcat fails to load a file, it shows nothing; so do we."""
+        mesh = parse_collada(_collada(TRIANGLE_GEOMETRY, nodes, libraries=libraries))
+
+        assert len(mesh.triangles) == 0
+        assert any("Meshcat fails to load" in w for w in mesh.warnings)

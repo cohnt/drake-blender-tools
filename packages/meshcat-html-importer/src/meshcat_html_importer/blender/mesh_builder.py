@@ -306,7 +306,7 @@ def _create_plane_mesh(
 def _create_from_mesh_file(
     geom: MeshFileGeometry,
     name: str,
-    path: str = "",
+    path: str,
 ) -> tuple[bpy.types.Object, "mathutils.Matrix"] | tuple[None, None]:
     """Create mesh by importing embedded mesh file.
 
@@ -322,16 +322,14 @@ def _create_from_mesh_file(
         failure, after printing a warning.
     """
     fmt = geom.format.lower()
-    where = path or name
 
     if fmt == "dae":
-        obj = _create_from_collada(geom, name, where)
-        return (obj, None) if obj is not None else (None, None)
+        return _create_from_collada(geom, name, path), None
 
     if fmt not in ("gltf", "glb", "obj"):
         print(
             f"Warning: Unsupported embedded mesh format '{geom.format}' "
-            f"for {where}; skipping"
+            f"for {path}; skipping"
         )
         return None, None
 
@@ -387,14 +385,14 @@ def _create_from_mesh_file(
                     _pack_images_for_object(main_obj)
                     return main_obj, None
 
-    print(f"Warning: Importing the embedded {fmt} mesh for {where} failed; skipping")
+    print(f"Warning: Importing the embedded {fmt} mesh for {path} failed; skipping")
     return None, None
 
 
 def _create_from_collada(
     geom: MeshFileGeometry,
     name: str,
-    where: str,
+    path: str,
 ) -> bpy.types.Object | None:
     """Build a mesh object from an embedded Collada (.dae) file.
 
@@ -403,29 +401,45 @@ def _create_from_collada(
     Vertices stay in the file's coordinates, like the OBJ import, so the
     Meshcat transforms apply the same way to both.
     """
-    collada = parse_collada(geom.data)
+    try:
+        collada = parse_collada(geom.data)
+    except Exception as exc:  # A reader bug must not abort the whole import.
+        print(f"Warning: Reading the Collada mesh for {path} failed ({exc}); skipping")
+        return None
+    for message in collada.notes:
+        print(f"Note: Collada mesh for {path}: {message}")
     for message in collada.warnings:
-        print(f"Warning: Collada mesh for {where}: {message}")
+        print(f"Warning: Collada mesh for {path}: {message}")
 
-    if len(collada.triangles) == 0:
-        print(f"Warning: Collada mesh for {where} has no drawable geometry; skipping")
+    num_triangles = len(collada.triangles)
+    if num_triangles == 0:
+        print(f"Warning: Collada mesh for {path} has no drawable geometry; skipping")
         return None
 
+    # The triangles are not validated: they are well formed by construction, and
+    # mesh.validate() would merge faces that share vertices, such as the two
+    # sides of a double-sided surface, which Meshcat draws separately.
     mesh = bpy.data.meshes.new(name)
-    mesh.from_pydata(collada.positions.tolist(), [], collada.triangles.tolist())
+    mesh.vertices.add(len(collada.positions))
+    mesh.vertices.foreach_set("co", collada.positions.astype(np.float32).ravel())
+    mesh.loops.add(3 * num_triangles)
+    mesh.loops.foreach_set("vertex_index", collada.triangles.astype(np.int32).ravel())
+    mesh.polygons.add(num_triangles)
+    mesh.polygons.foreach_set(
+        "loop_start", np.arange(0, 3 * num_triangles, 3, dtype=np.int32)
+    )
+    mesh.update(calc_edges=True)
 
-    # Corner data follows the triangle order, which from_pydata keeps for loops.
+    # Corner data is in triangle order, which is the loop order.
     if collada.corner_uvs is not None:
         uv_layer = mesh.uv_layers.new(name="UVMap")
         uv_layer.data.foreach_set("uv", collada.corner_uvs.astype(np.float32).ravel())
 
     if collada.corner_normals is not None:
         mesh.shade_smooth()
-        mesh.normals_split_custom_set(collada.corner_normals.tolist())
+        mesh.normals_split_custom_set(collada.corner_normals.astype(np.float32))
 
-    mesh.validate()
     mesh.update()
-
     return bpy.data.objects.new(name, mesh)
 
 
