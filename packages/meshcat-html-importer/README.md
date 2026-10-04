@@ -96,10 +96,5 @@ Meshcat HTML recordings contain:
 - Positions, normals, UVs, and indices from BufferGeometry
 - Procedural primitives (box, sphere, cylinder)
 - Embedded glTF/OBJ/Collada mesh files
-- Collada (.dae) meshes are read by a built-in reader that follows the steps
-  Meshcat takes (three.js's ColladaLoader, then Meshcat's merge), quirks
-  included, so the result matches the browser: geometry and node transforms,
-  colored with the Drake Rgba. Like Meshcat, it ignores `<unit>`,
-  `<up_axis>`, Collada materials and vertex colors, skips `<polygons>`, lines
-  and skinned meshes, and imports nothing for files Meshcat fails to show.
-  Each such case is reported with a printed warning or note.
+- Collada (.dae) meshes are imported exactly as Meshcat shows them (see the
+  `scene/collada.py` docstring)

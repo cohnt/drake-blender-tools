@@ -15,21 +15,26 @@ same steps, quirks included, so the Blender object matches the browser:
   nodes and ``instance_node`` are baked into the vertices. A geometry
   instanced more than once is one shared three.js geometry, and
   merge_geometries transforms it in place once per instance. Every copy is
-  therefore drawn at the product of all the instance transforms.
+  therefore drawn at the product of all the instance transforms. A node whose
+  only content is an ``instance_node`` gives the instanced copy its own
+  transform in place of the copy's.
 - ``<unit>`` and ``<up_axis>`` are ignored. ColladaLoader applies them only to
   ``scene.rotation`` and ``scene.scale``, and merge_geometries reads
   ``scene.matrix``, which is never updated.
-- ``polygons``, lines and skinned meshes are not drawn. Merging meshes whose
-  attributes differ (say one with normals and one without) fails, and so do
-  several malformed inputs; Meshcat then shows nothing, and so is nothing
-  imported here.
-- Materials, textures and vertex colors are not shown by Meshcat, so they are
-  only tracked as far as they affect the steps above.
+- ``polygons``, lines and skinned meshes are not drawn.
+- Materials, textures and vertex colors are not shown, since Meshcat uses the
+  material Drake sends. They are only checked where three.js would fail on
+  them.
+- Where three.js throws, Meshcat shows nothing, and nothing is imported. This
+  covers meshes whose attributes differ (say one with normals and one
+  without), which three.js cannot merge, and many malformed inputs: missing
+  references, unusable materials, effects, images, cameras or lights,
+  instanced morph controllers, incomplete skins, and more.
 
 Each skipped or ignored item is reported in ``ColladaMesh.warnings`` or
-``ColladaMesh.notes``. Parsing of libraries that do not affect geometry
-(materials, effects, animations, ...) is not reproduced, so a file that
-three.js rejects only because of those still imports.
+``ColladaMesh.notes``. Not reproduced: failures that come only from
+``<library_animations>``, ``<library_animation_clips>`` or the kinematics and
+physics libraries, which do not affect geometry; such files still import.
 """
 
 from __future__ import annotations
@@ -58,12 +63,28 @@ class _MeshcatFails(Exception):
     """three.js throws while loading the file, so Meshcat shows nothing."""
 
 
+# Larger inputs exhaust the browser before they draw anything.
+_MAX_VALUES = 2**31
+
 # JavaScript number parsing: parseFloat and parseInt accept the longest valid
 # prefix of a token and give NaN when there is none.
-_JS_FLOAT = re.compile(r"[+-]?(?:Infinity|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
-_JS_INT = re.compile(r"([+-]?)(?:0[xX]([0-9a-fA-F]+)|(\d+))")
+_JS_FLOAT = re.compile(
+    r"[+-]?(?:Infinity|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", re.ASCII
+)
+_JS_INT = re.compile(r"([+-]?)(?:0[xX]([0-9a-fA-F]*)|(\d+))", re.ASCII)
 _NOT_PLAIN_FLOAT = re.compile(r"[^0-9eE+\-.\s]")
 _NOT_PLAIN_INT = re.compile(r"[^0-9+\-\s]")
+
+# Name of the document's root element, after any prolog.
+_ROOT_NAME = re.compile(
+    rb"\A(?:\xef\xbb\xbf)?(?:\s+|<\?.*?\?>|<!--.*?-->|<!DOCTYPE[^\[>]*(?:\[.*?\])?\s*>)*"
+    rb"<([^\s/>]+)",
+    re.S,
+)
+
+_SHADERS = ("constant", "lambert", "blinn", "phong")
+_TEXTURED_PARAMETERS = ("diffuse", "specular", "bump", "ambient", "emission")
+_OPAQUE_MODES = ("A_ONE", "RGB_ZERO", "A_ZERO", "RGB_ONE")
 
 
 def _js_float(token: str) -> float:
@@ -74,15 +95,21 @@ def _js_float(token: str) -> float:
 
 
 def _js_int(token: str | None) -> float:
-    """parseInt, returned as a float so that NaN can be represented."""
+    """parseInt, returned as a float so that NaN and Infinity can be represented."""
     if token is None:
         return math.nan
     match = _JS_INT.match(token.lstrip())
     if match is None:
         return math.nan
     sign, hex_digits, digits = match.groups()
-    value = int(hex_digits, 16) if hex_digits else int(digits)
-    return float(-value if sign == "-" else value)
+    if hex_digits == "":
+        return math.nan  # "0x" with no digits
+    value = int(hex_digits, 16) if hex_digits is not None else int(digits)
+    try:
+        number = float(value)
+    except OverflowError:
+        number = math.inf
+    return -number if sign == "-" else number
 
 
 def _tokens(text: str | None) -> list[str]:
@@ -97,7 +124,7 @@ def _floats(text: str | None) -> np.ndarray:
     if tokens and not _NOT_PLAIN_FLOAT.search(text):
         try:
             return np.array(tokens, dtype=np.float64)
-        except ValueError:
+        except (ValueError, OverflowError):
             pass
     return np.array([_js_float(t) for t in tokens], dtype=np.float64)
 
@@ -107,13 +134,23 @@ def _ints(text: str | None) -> np.ndarray:
     if tokens and not _NOT_PLAIN_INT.search(text):
         try:
             return np.array(tokens, dtype=np.int64).astype(np.float64)
-        except ValueError:
+        except (ValueError, OverflowError):
             pass
     return np.array([_js_int(t) for t in tokens], dtype=np.float64)
 
 
 def _js_max(a: float, b: float) -> float:
     return math.nan if math.isnan(a) or math.isnan(b) else max(a, b)
+
+
+def _text(el: ET.Element) -> str:
+    # Like the DOM's textContent: the text of the element and all descendants.
+    return "".join(el.itertext())
+
+
+def _key(value: str | None) -> str:
+    # A missing attribute used as a JavaScript object key becomes "null".
+    return "null" if value is None else value
 
 
 def _url_id(url: str | None) -> str:
@@ -133,6 +170,11 @@ def _first_library(root: ET.Element, library: str, tag: str) -> list[ET.Element]
     return _children(libraries[0], tag) if libraries else []
 
 
+def _by_id(elements: list[ET.Element]) -> dict[str, ET.Element]:
+    # Library entries are stored by id, so a later duplicate replaces an earlier one.
+    return {_key(el.get("id")): el for el in elements}
+
+
 @dataclass
 class _Source:
     array: np.ndarray  # Flat values
@@ -142,20 +184,37 @@ class _Source:
 @dataclass
 class _Primitive:
     type: str
-    inputs: dict[str, tuple[str, float]]  # key -> (source id, offset)
-    stride: float
-    has_uv: bool
-    vcount: np.ndarray | None
-    p: np.ndarray | None
+    material: str | None
+    count: float  # parseInt of the count attribute
+    inputs: dict[str, tuple[str, float]] = field(default_factory=dict)  # (id, offset)
+    stride: float = 0.0
+    has_uv: bool = False
+    vcount: np.ndarray | None = None
+    p: np.ndarray | None = None
+    starts: np.ndarray | None = None  # Cached result of _corner_starts
 
 
 @dataclass
 class _GeometryData:
-    sources: dict[str | None, _Source]
-    vertices: dict[str | None, str]  # semantic -> source id
-    primitives: list[_Primitive]
+    sources: dict[str, _Source] = field(default_factory=dict)
+    vertices: dict[str, str] = field(default_factory=dict)  # semantic -> source id
+    primitives: list[_Primitive] = field(default_factory=list)
     skinned: bool = False
     build: list[_TypeGeometry] | None = None
+
+
+@dataclass
+class _Controller:
+    geometry_id: str | None  # None when there is no <skin> or <morph>
+    skin: ET.Element | None
+
+
+@dataclass
+class _Instance:
+    """An instance_geometry or instance_controller."""
+
+    id: str
+    materials: dict[str, str]  # bind_material symbol -> material id
 
 
 class _TypeGeometry:
@@ -164,6 +223,7 @@ class _TypeGeometry:
     def __init__(self, primitive_type: str):
         self.type = primitive_type
         self.attributes: dict[str, tuple[np.ndarray, float]] = {}
+        self.material_keys: list[str] = []
         self.skinned = False
 
     def apply_matrix(self, matrix: np.ndarray) -> None:
@@ -171,8 +231,7 @@ class _TypeGeometry:
         positions = self._xyz("position")
         if positions is not None:
             homogeneous = np.c_[positions, np.ones(len(positions))] @ matrix.T
-            with np.errstate(divide="ignore", invalid="ignore"):
-                positions[:] = homogeneous[:, :3] / homogeneous[:, 3:]
+            positions[:] = homogeneous[:, :3] / homogeneous[:, 3:]
         normals = self._xyz("normal")
         if normals is not None:
             linear = matrix[:3, :3]
@@ -230,13 +289,13 @@ class _Object3D:
 
 @dataclass
 class _NodeData:
-    id: str | None
+    id: str
     matrix: np.ndarray
-    nodes: list[str | None] = field(default_factory=list)
+    nodes: list[str] = field(default_factory=list)
     cameras: list[str] = field(default_factory=list)
-    controllers: list[str] = field(default_factory=list)
+    controllers: list[_Instance] = field(default_factory=list)
     lights: list[str] = field(default_factory=list)
-    geometries: list[str] = field(default_factory=list)
+    geometries: list[_Instance] = field(default_factory=list)
     instance_nodes: list[str] = field(default_factory=list)
     build: _Object3D | None = None
     building: bool = False
@@ -249,12 +308,14 @@ class _Loader:
         self.root = root
         self.warnings: list[str] = []
         self.notes: list[str] = []
-        self.geometries: dict[str | None, _GeometryData] = {}
-        self.nodes: dict[str | None, _NodeData] = {}
-        self.controllers: dict[str | None, dict] = {}
-        self.visual_scenes: dict[str | None, list[_NodeData]] = {}
-        self.cameras: set[str | None] = set()
-        self.lights: set[str | None] = set()
+        self.geometries: dict[str, _GeometryData] = {}
+        self.nodes: dict[str, _NodeData] = {}
+        self.controllers: dict[str, _Controller] = {}
+        self.visual_scenes: dict[str, list[_NodeData]] = {}
+        self.cameras = _by_id(_first_library(root, "library_cameras", "camera"))
+        self.lights = _by_id(_first_library(root, "library_lights", "light"))
+        self.materials = _by_id(_first_library(root, "library_materials", "material"))
+        self.effects = _by_id(_first_library(root, "library_effects", "effect"))
         self._default_ids = 0
 
     def warn(self, message: str) -> None:
@@ -263,13 +324,6 @@ class _Loader:
 
     def load(self) -> _TypeGeometry | None:
         self._read_asset()
-        self.cameras = {
-            el.get("id")
-            for el in _first_library(self.root, "library_cameras", "camera")
-        }
-        self.lights = {
-            el.get("id") for el in _first_library(self.root, "library_lights", "light")
-        }
         for el in _first_library(self.root, "library_controllers", "controller"):
             self._read_controller(el)
         for el in _first_library(self.root, "library_geometries", "geometry"):
@@ -279,9 +333,9 @@ class _Loader:
         for el in _first_library(self.root, "library_visual_scenes", "visual_scene"):
             self._read_visual_scene(el)
 
-        # Like ColladaLoader, build every material, controller, geometry and
-        # visual scene, used or not; any of them can make the whole load fail.
-        self._check_materials()
+        # Like ColladaLoader, build every library entry, used or not; any of
+        # them can make the whole load fail.
+        self._check_libraries()
         for controller in self.controllers.values():
             self._build_controller(controller)
         for geometry in self.geometries.values():
@@ -319,58 +373,59 @@ class _Loader:
                 )
         axes = _children(assets[0], "up_axis")
         if axes:
-            axis = "".join(axes[0].itertext())
+            axis = _text(axes[0])
             if axis != "Y_UP":
                 self.notes.append(
                     f"<up_axis>{axis}</up_axis> ignored, as Meshcat does not apply it"
                 )
 
     def _read_controller(self, el: ET.Element) -> None:
-        controller: dict = {}
+        controller = _Controller(geometry_id=None, skin=None)
         for child in el:
             if child.tag in ("skin", "morph"):
-                controller["id"] = _url_id(child.get("source"))
+                controller.geometry_id = _url_id(child.get("source"))
             if child.tag == "skin":
-                controller["skin"] = child
-        self.controllers[el.get("id")] = controller
+                controller.skin = child
+        self.controllers[_key(el.get("id"))] = controller
 
     def _read_geometry(self, el: ET.Element) -> None:
         meshes = _children(el, "mesh")
         if not meshes:
             return
-        data = _GeometryData(sources={}, vertices={}, primitives=[])
+        data = _GeometryData()
         for child in meshes[0]:
             if child.tag == "source":
-                data.sources[child.get("id")] = _read_source(child)
+                data.sources[_key(child.get("id"))] = _read_source(child)
             elif child.tag == "vertices":
                 data.vertices = {
-                    inp.get("semantic"): _url_id(inp.get("source")) for inp in child
+                    _key(inp.get("semantic")): _url_id(inp.get("source"))
+                    for inp in child
                 }
             elif child.tag in ("triangles", "polylist", "lines", "linestrips"):
                 data.primitives.append(_read_primitive(child))
             elif child.tag in ("polygons", "tristrips", "trifans"):
                 self.warn(f"<{child.tag}> skipped; three.js's ColladaLoader rejects it")
-        self.geometries[el.get("id")] = data
+        self.geometries[_key(el.get("id"))] = data
 
     def _read_node(self, el: ET.Element) -> _NodeData:
-        data = _NodeData(id=el.get("id"), matrix=np.eye(4))
+        data = _NodeData(id=_key(el.get("id")), matrix=np.eye(4))
         for child in el:
             tag = child.tag
             if tag == "node":
-                data.nodes.append(child.get("id"))
+                data.nodes.append(_key(child.get("id")))
                 self._read_node(child)
             elif tag == "instance_camera":
                 data.cameras.append(_url_id(child.get("url")))
             elif tag == "instance_controller":
-                data.controllers.append(_url_id(child.get("url")))
+                data.controllers.append(_read_instance(child))
             elif tag == "instance_light":
                 data.lights.append(_url_id(child.get("url")))
             elif tag == "instance_geometry":
-                data.geometries.append(_url_id(child.get("url")))
+                data.geometries.append(_read_instance(child))
             elif tag == "instance_node":
                 data.instance_nodes.append(_url_id(child.get("url")))
             elif tag in ("matrix", "translate", "rotate", "scale"):
-                data.matrix = data.matrix @ _transform(tag, _floats(child.text))
+                data.matrix = data.matrix @ _transform(tag, _floats(_text(child)))
             elif tag in ("lookat", "skew"):
                 self.warn(f"<{tag}> transform ignored, as Meshcat does")
         if data.id in self.nodes:
@@ -384,39 +439,93 @@ class _Loader:
             if node.get("id") is None:
                 node.set("id", f"three_default_{self._default_ids}")
                 self._default_ids += 1
-        self.visual_scenes[el.get("id")] = [
+        self.visual_scenes[_key(el.get("id"))] = [
             self._read_node(node) for node in _children(el, "node")
         ]
 
     # Building
 
-    def _check_materials(self) -> None:
-        """Raise where ColladaLoader's material build would throw.
+    def _check_libraries(self) -> None:
+        """Raise where ColladaLoader fails to build an image, camera, light or
+        material. None of them change what Meshcat draws."""
+        for image in _first_library(self.root, "library_images", "image"):
+            if not _children(image, "init_from"):
+                raise _MeshcatFails(f"image {image.get('id')!r} has no <init_from>")
+        for camera_id, camera in self.cameras.items():
+            if not _children(camera, "optics"):
+                raise _MeshcatFails(f"camera {camera_id!r} has no <optics>")
+        for light_id, light in self.lights.items():
+            techniques = _children(light, "technique_common")
+            kinds = ("directional", "point", "spot", "ambient")
+            if not techniques or not any(c.tag in kinds for c in techniques[-1]):
+                raise _MeshcatFails(f"light {light_id!r} has no known type")
+        for material_id, material in self.materials.items():
+            self._check_material(material_id, material)
 
-        Materials do not change what Meshcat draws, but a material whose effect
-        cannot be built makes the whole file fail to load.
-        """
-        effects = {
-            el.get("id"): el
-            for el in _first_library(self.root, "library_effects", "effect")
-        }
-        for material in _first_library(self.root, "library_materials", "material"):
-            instances = _children(material, "instance_effect")
-            effect_id = _url_id(instances[-1].get("url")) if instances else None
-            effect = effects.get(effect_id)
-            profiles = _children(effect, "profile_COMMON") if effect is not None else []
-            if not profiles or not _children(profiles[-1], "technique"):
-                raise _MeshcatFails(
-                    f"material {material.get('id')!r} has no usable effect"
-                )
+    def _check_material(self, material_id: str, material: ET.Element) -> None:
+        """Raise where ColladaLoader's buildMaterial would throw."""
+        instances = _children(material, "instance_effect")
+        effect_id = _url_id(instances[-1].get("url")) if instances else "undefined"
+        effect = self.effects.get(effect_id)
+        profiles = _children(effect, "profile_COMMON") if effect is not None else []
+        techniques = _children(profiles[-1], "technique") if profiles else []
+        shaders = [c for c in techniques[-1] if c.tag in _SHADERS] if techniques else []
+        if not shaders:
+            raise _MeshcatFails(f"material {material_id!r} has no usable effect")
+        profile, technique = profiles[-1], techniques[-1]
 
-    def _build_controller(self, controller: dict) -> None:
-        if "skin" not in controller:
+        # A texture whose sampler names no surface makes three.js throw.
+        surfaces = set()
+        samplers = {}
+        for newparam in _children(profile, "newparam"):
+            sid = _key(newparam.get("sid"))
+            for child in newparam:
+                if child.tag == "surface":
+                    surfaces.add(sid)
+                elif child.tag == "sampler2D":
+                    sources = _children(child, "source")
+                    samplers[sid] = _text(sources[-1]) if sources else "undefined"
+
+        def check_texture(texture: ET.Element) -> None:
+            sampler = _key(texture.get("texture"))
+            if sampler in samplers and samplers[sampler] not in surfaces:
+                raise _MeshcatFails(f"sampler {sampler!r} has no surface")
+
+        parameters = {child.tag: child for child in shaders[-1]}
+        for name in _TEXTURED_PARAMETERS:
+            textures = (
+                _children(parameters[name], "texture") if name in parameters else []
+            )
+            if textures:
+                check_texture(textures[-1])
+
+        # Opacity is read from the <transparent> color, which must then exist.
+        transparent = parameters.get("transparent")
+        if (
+            transparent is not None
+            and not _children(transparent, "texture")
+            and not _children(transparent, "color")
+            and transparent.get("opaque", "A_ONE") in _OPAQUE_MODES
+        ):
+            raise _MeshcatFails(f"material {material_id!r} has an empty <transparent>")
+
+        # So does a <bump> without a <texture> in the technique's <extra>.
+        extras = _children(technique, "extra")
+        extra_techniques = _children(extras[-1], "technique") if extras else []
+        bumps = _children(extra_techniques[-1], "bump") if extra_techniques else []
+        if bumps:
+            textures = _children(bumps[-1], "texture")
+            if not textures:
+                raise _MeshcatFails(f"material {material_id!r} has an empty <bump>")
+            check_texture(textures[-1])
+
+    def _build_controller(self, controller: _Controller) -> None:
+        if controller.skin is None:
             return
-        geometry = self.geometries.get(controller.get("id"))
+        geometry = self.geometries.get(controller.geometry_id)
         if geometry is None:
             raise _MeshcatFails("a skin controller's source geometry is missing")
-        _check_skin(controller["skin"])
+        _check_skin(controller.skin)
         geometry.skinned = True
 
     def _build_geometry(self, data: _GeometryData) -> list[_TypeGeometry]:
@@ -453,6 +562,8 @@ class _Loader:
             return values
 
         for prim in primitives:
+            if prim.type == "polylist" and prim.vcount is None and prim.count >= 1:
+                raise _MeshcatFails("<polylist> has no <vcount>")
             for key, (source_id, offset) in prim.inputs.items():
                 if key == "VERTEX":
                     for semantic, vertex_source in data.vertices.items():
@@ -487,13 +598,18 @@ class _Loader:
             values = np.concatenate(parts) if parts else np.zeros(0)
             if len(values):
                 geometry.attributes[name] = (values, sizes[name])
+        geometry.material_keys = [prim.material for prim in primitives if prim.material]
         geometry.skinned = skin_count > 0
         return geometry
 
-    def _objects(self, data: _GeometryData) -> list[_Object3D]:
+    def _objects(self, instance: _Instance, data: _GeometryData) -> list[_Object3D]:
         """buildObjects: one new object per primitive type, sharing geometry."""
         objects = []
         for geometry in self._build_geometry(data):
+            for key in geometry.material_keys:
+                material_id = instance.materials.get(key)
+                if material_id is not None and material_id not in self.materials:
+                    raise _MeshcatFails(f"material {material_id!r} not found")
             if geometry.type in ("lines", "linestrips"):
                 objects.append(_Object3D("line", geometry))
             elif geometry.skinned:
@@ -502,7 +618,7 @@ class _Loader:
                 objects.append(_Object3D("mesh", geometry))
         return objects
 
-    def _node(self, node_id: str | None) -> _Object3D:
+    def _node(self, node_id: str) -> _Object3D:
         data = self.nodes.get(node_id)
         if data is None:
             raise _MeshcatFails(f"node {node_id!r} not found")
@@ -517,22 +633,22 @@ class _Loader:
         """ColladaLoader's buildNode."""
         objects = [self._node(node_id) for node_id in data.nodes]
         objects += [_Object3D("other") for cam in data.cameras if cam in self.cameras]
-        for controller_id in data.controllers:
-            controller = self.controllers.get(controller_id)
+        for instance in data.controllers:
+            controller = self.controllers.get(instance.id)
             if controller is None:
-                raise _MeshcatFails(f"controller {controller_id!r} not found")
-            geometry = self.geometries.get(controller.get("id"))
+                raise _MeshcatFails(f"controller {instance.id!r} not found")
+            geometry = self.geometries.get(controller.geometry_id)
             if geometry is None:
-                raise _MeshcatFails(f"controller {controller_id!r} has no geometry")
-            if "skin" not in controller:
+                raise _MeshcatFails(f"controller {instance.id!r} has no geometry")
+            objects += self._objects(instance, geometry)
+            if controller.skin is None:
                 raise _MeshcatFails("an instanced <morph> controller")
-            objects += self._objects(geometry)
         objects += [_Object3D("other") for light in data.lights if light in self.lights]
-        for geometry_id in data.geometries:
-            geometry = self.geometries.get(geometry_id)
+        for instance in data.geometries:
+            geometry = self.geometries.get(instance.id)
             if geometry is None:
-                raise _MeshcatFails(f"geometry {geometry_id!r} not found")
-            objects += self._objects(geometry)
+                raise _MeshcatFails(f"geometry {instance.id!r} not found")
+            objects += self._objects(instance, geometry)
         objects += [self._node(node_id).clone() for node_id in data.instance_nodes]
 
         if not data.nodes and len(objects) == 1:
@@ -600,10 +716,10 @@ def _same_size(a: float, b: float) -> bool:
 
 
 def _read_source(el: ET.Element) -> _Source:
-    source = _Source(np.zeros(0), 3.0)
+    source = _Source(array=np.zeros(0), stride=3.0)
     for child in el:
         if child.tag in ("float_array", "Name_array"):
-            source.array = _floats(child.text)
+            source.array = _floats(_text(child))
         elif child.tag == "technique_common":
             accessors = _children(child, "accessor")
             if accessors:
@@ -612,10 +728,12 @@ def _read_source(el: ET.Element) -> _Source:
 
 
 def _read_primitive(el: ET.Element) -> _Primitive:
-    prim = _Primitive(el.tag, {}, 0.0, False, None, None)
+    prim = _Primitive(
+        type=el.tag, material=el.get("material"), count=_js_int(el.get("count"))
+    )
     for child in el:
         if child.tag == "input":
-            semantic = child.get("semantic")
+            semantic = child.get("semantic") or "null"
             offset = _js_int(child.get("offset"))
             set_index = _js_int(child.get("set"))
             key = f"{semantic}{int(set_index)}" if set_index > 0 else semantic
@@ -623,40 +741,54 @@ def _read_primitive(el: ET.Element) -> _Primitive:
             prim.stride = _js_max(prim.stride, offset + 1)
             prim.has_uv |= semantic == "TEXCOORD"
         elif child.tag == "vcount":
-            prim.vcount = _ints(child.text)
+            prim.vcount = _ints(_text(child))
         elif child.tag == "p":
-            prim.p = _ints(child.text)
+            prim.p = _ints(_text(child))
     return prim
+
+
+def _read_instance(el: ET.Element) -> _Instance:
+    # ColladaLoader reads every <instance_material> inside each <bind_material>.
+    materials = {
+        _key(binding.get("symbol")): _url_id(binding.get("target"))
+        for bind_material in _children(el, "bind_material")
+        for binding in bind_material.iter("instance_material")
+    }
+    return _Instance(id=_url_id(el.get("url")), materials=materials)
 
 
 def _check_skin(skin: ET.Element) -> None:
     """Raise where ColladaLoader's skin build would throw."""
-    sources = {s.get("id"): s for s in _children(skin, "source")}
+    sources = _by_id(_children(skin, "source"))
     joints = _children(skin, "joints")
     weights = _children(skin, "vertex_weights")
     if not joints or not weights:
         raise _MeshcatFails("a <skin> lacks <joints> or <vertex_weights>")
     joint_inputs = {
-        inp.get("semantic"): inp.get("source") for inp in _children(joints[0], "input")
+        _key(inp.get("semantic")): _url_id(inp.get("source"))
+        for inp in _children(joints[-1], "input")
     }
     weight_inputs = {
-        inp.get("semantic"): inp.get("source") for inp in _children(weights[0], "input")
+        _key(inp.get("semantic")): _url_id(inp.get("source"))
+        for inp in _children(weights[-1], "input")
     }
+    vcounts = _children(weights[-1], "vcount")
     if (
         "JOINT" not in weight_inputs
-        or "WEIGHT" not in weight_inputs
-        or (weight_inputs["WEIGHT"] or "")[1:] not in sources
-        or (joint_inputs.get("JOINT") or "")[1:] not in sources
-        or not _children(weights[0], "vcount")
+        or weight_inputs.get("WEIGHT") not in sources
+        or joint_inputs.get("JOINT") not in sources
+        or not vcounts
     ):
         raise _MeshcatFails("a <skin> is incomplete")
-    joint_source = sources[joint_inputs["JOINT"][1:]]
-    has_joints = any(
-        _tokens(el.text)
-        for el in joint_source
-        if el.tag in ("float_array", "Name_array")
-    )
-    if has_joints and (joint_inputs.get("INV_BIND_MATRIX") or "")[1:] not in sources:
+    if not _children(weights[-1], "v") and (_ints(_text(vcounts[-1])) > 0).any():
+        raise _MeshcatFails("a <skin> has <vcount> but no <v>")
+    joint_arrays = [
+        child
+        for child in sources[joint_inputs["JOINT"]]
+        if child.tag in ("float_array", "Name_array")
+    ]
+    has_joints = bool(joint_arrays) and bool(_tokens(_text(joint_arrays[-1])))
+    if has_joints and joint_inputs.get("INV_BIND_MATRIX") not in sources:
         raise _MeshcatFails("a <skin> lacks INV_BIND_MATRIX")
 
 
@@ -682,8 +814,11 @@ def _rotation_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
     Like three.js, the axis is used as given (not normalized).
     """
     x, y, z = (float(v) for v in axis)
-    c = math.cos(angle)
-    s = math.sin(angle)
+    if math.isfinite(angle):
+        c = math.cos(angle)
+        s = math.sin(angle)
+    else:
+        c = s = math.nan  # Math.cos(Infinity) is NaN in JavaScript
     t = 1.0 - c
     tx = t * x
     ty = t * y
@@ -703,6 +838,12 @@ def _corner_starts(prim: _Primitive) -> np.ndarray:
     Quads become (0, 1, 3), (1, 2, 3); larger polygons fan around their first
     corner. Values can be NaN, which then read nothing.
     """
+    if prim.starts is None:
+        prim.starts = _compute_corner_starts(prim)
+    return prim.starts
+
+
+def _compute_corner_starts(prim: _Primitive) -> np.ndarray:
     stride = prim.stride
     if prim.p is None:
         raise _MeshcatFails(f"<{prim.type}> has no <p>")
@@ -713,19 +854,26 @@ def _corner_starts(prim: _Primitive) -> np.ndarray:
             raise _MeshcatFails(f"<{prim.type}> has a zero stride")
         return np.arange(0, len(prim.p), stride, dtype=np.float64)
 
-    starts = []
-    base = 0.0
-    for n in prim.vcount.tolist():
-        if n == 3:
-            starts += [base, base + stride, base + 2 * stride]
-        elif n == 4:
-            a, b, c, d = (base + k * stride for k in range(4))
-            starts += [a, b, d, b, c, d]
-        elif n > 4:
-            for k in range(1, int(n) - 1):
-                starts += [base, base + k * stride, base + (k + 1) * stride]
-        base += stride * n
-    return np.array(starts, dtype=np.float64)
+    sides = prim.vcount
+    triangles = np.where(
+        sides == 3, 1, np.where(sides == 4, 2, np.where(sides > 4, sides - 2, 0))
+    )
+    if 3 * triangles.sum() > _MAX_VALUES:
+        raise _MeshcatFails("<polylist> is too large to load")
+    triangles = triangles.astype(np.int64)
+    bases = np.r_[0.0, np.cumsum(stride * sides)[:-1]]
+
+    polygon = np.repeat(np.arange(len(sides)), triangles)
+    k = np.arange(triangles.sum()) - np.repeat(
+        np.cumsum(triangles) - triangles, triangles
+    )
+    quad = sides[polygon] == 4
+    first = np.where(quad & (k == 1), 1, 0)
+    second = np.where(quad, np.where(k == 0, 1, 2), k + 1)
+    third = np.where(quad, 3, k + 2)
+    base = bases[polygon]
+    corners = np.stack([first, second, third], axis=1) * stride + base[:, None]
+    return corners.ravel()
 
 
 def _p_entries(prim: _Primitive, offset: float) -> np.ndarray:
@@ -742,17 +890,26 @@ def _corner_count(prim: _Primitive, offset: float) -> int:
 
 
 def _gather(prim: _Primitive, source: _Source, offset: float) -> np.ndarray:
-    """Values ColladaLoader pushes for one input: ``stride`` per valid corner."""
+    """Values ColladaLoader pushes for one input: ``stride`` per valid corner.
+
+    Values past either end of the source array are NaN (undefined in JS).
+    """
     entries = _p_entries(prim, offset)
     entries = entries[np.isfinite(entries)]
     stride = source.stride
     if math.isnan(stride) or stride <= 0 or len(entries) == 0:
         return np.zeros(0)
+    if stride * len(entries) > _MAX_VALUES:
+        raise _MeshcatFails("an input is too large to load")
     stride = int(stride)
-    index = (entries * stride).astype(np.int64)[:, None] + np.arange(stride)
+    starts = entries * stride
+    values = np.full((len(entries), stride), np.nan)
+    overlaps = (starts > -stride) & (starts < len(source.array))
+    index = starts[overlaps].astype(np.int64)[:, None] + np.arange(stride)
     inside = (index >= 0) & (index < len(source.array))
-    values = np.full(index.shape, np.nan)
-    values[inside] = source.array[index[inside]]
+    rows = np.full(index.shape, np.nan)
+    rows[inside] = source.array[index[inside]]
+    values[overlaps] = rows
     return values.ravel()
 
 
@@ -770,6 +927,16 @@ def parse_collada(data: bytes | str) -> ColladaMesh:
     """
     if isinstance(data, str):
         data = data.encode("utf-8")
+
+    # three.js looks for a document child named "COLLADA". It finds a
+    # <!DOCTYPE COLLADA> first, and misses a namespace-prefixed root.
+    root_name = _ROOT_NAME.match(data)
+    if root_name is not None:
+        if re.search(rb"<!DOCTYPE\s+COLLADA\b", data[: root_name.start(1)]):
+            return _empty_mesh(["<!DOCTYPE COLLADA> makes Meshcat show nothing"])
+        if b":" in root_name.group(1):
+            return _empty_mesh(["a prefixed root element makes Meshcat show nothing"])
+
     try:
         root = ET.fromstring(data)
     except ET.ParseError as exc:
@@ -782,12 +949,13 @@ def parse_collada(data: bytes | str) -> ColladaMesh:
         return _empty_mesh([f"root element is <{root.tag}>; Meshcat shows nothing"])
 
     loader = _Loader(root)
-    try:
-        geometry = loader.load()
-    except _MeshcatFails as exc:
-        message = f"Meshcat fails to load this file ({exc}) and shows nothing"
-        return _empty_mesh(loader.warnings + [message], loader.notes)
-    mesh = _triangle_mesh(geometry, loader.warnings)
+    with np.errstate(all="ignore"):  # NaN and Inf are expected from bad files.
+        try:
+            geometry = loader.load()
+        except _MeshcatFails as exc:
+            message = f"Meshcat fails to load this file ({exc}) and shows nothing"
+            return _empty_mesh(loader.warnings + [message], loader.notes)
+        mesh = _triangle_mesh(geometry, loader.warnings)
     mesh.notes = loader.notes
     return mesh
 

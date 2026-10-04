@@ -438,6 +438,9 @@ def _create_from_collada(
     if collada.corner_normals is not None:
         mesh.shade_smooth()
         mesh.normals_split_custom_set(collada.corner_normals.astype(np.float32))
+    else:
+        # Meshcat computes flat normals for a mesh without them.
+        mesh.shade_flat()
 
     mesh.update()
     return bpy.data.objects.new(name, mesh)

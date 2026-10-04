@@ -135,8 +135,10 @@ TETRA_POSITIONS = [
 TETRA_TRIANGLES = [(0, 2, 1), (0, 1, 3), (0, 3, 2), (1, 2, 3)]
 
 
-def _make_collada_geometry(asset: str = "<up_axis>Y_UP</up_axis>") -> MeshFileGeometry:
-    """Create a tiny Collada tetrahedron with per-corner normals.
+def _make_collada_geometry(
+    asset: str = "<up_axis>Y_UP</up_axis>", normals: bool = True
+) -> MeshFileGeometry:
+    """Create a tiny Collada tetrahedron, with per-corner normals by default.
 
     The node translation is part of the file, so it must be baked into the
     vertices, as Meshcat does.
@@ -166,7 +168,7 @@ def _make_collada_geometry(asset: str = "<up_axis>Y_UP</up_axis>") -> MeshFileGe
         <vertices id="verts"><input semantic="POSITION" source="#pos"/></vertices>
         <triangles count="4">
           <input offset="0" semantic="VERTEX" source="#verts"/>
-          <input offset="1" semantic="NORMAL" source="#nrm"/>
+          {'<input offset="1" semantic="NORMAL" source="#nrm"/>' if normals else ""}
           <p>{p}</p>
         </triangles>
       </mesh>
@@ -183,6 +185,8 @@ def _make_collada_geometry(asset: str = "<up_axis>Y_UP</up_axis>") -> MeshFileGe
   <scene><instance_visual_scene url="#scene"/></scene>
 </COLLADA>
 """
+    if not normals:
+        dae = dae.replace(f"<p>{p}</p>", f"<p>{' '.join(p.split()[::2])}</p>")
     return MeshFileGeometry(format="dae", data=dae.encode("utf-8"))
 
 
@@ -360,6 +364,18 @@ class TestBlenderMeshfileImport:
             [tuple(d.uv) for d in mesh.uv_layers["UVMap"].data], uvs, atol=1e-6
         )
 
+    def test_dae_without_normals_is_flat_shaded(self):
+        """Meshcat computes flat normals for a dae without NORMAL; so does Blender."""
+        node = SceneNode(
+            path="/flat", name="flat", geometry=_make_collada_geometry(normals=False)
+        )
+
+        obj, _ = create_mesh_file_object(node, name="flat")
+
+        assert len(obj.data.polygons) == 4
+        assert not obj.data.has_custom_normals
+        assert not any(polygon.use_smooth for polygon in obj.data.polygons)
+
     def test_dae_object_matches_obj_object(self):
         """A dae and an OBJ of the same vertices land in the same place.
 
@@ -396,6 +412,14 @@ class TestBlenderMeshfileImport:
         dists = np.linalg.norm(dae_verts[:, None, :] - obj_verts[None, :, :], axis=2)
         assert dists.min(axis=1).max() < 1e-6
         assert dists.min(axis=0).max() < 1e-6
+        # Both are placed by the Meshcat transform: rotate 45 deg about z, then
+        # translate.
+        c = s = np.sqrt(0.5)
+        expected = (np.array(TETRA_POSITIONS) + [0.5, 0, 0]) @ np.array(
+            [[c, s, 0], [-s, c, 0], [0, 0, 1]]
+        ) + [1.0, -2.0, 0.5]
+        dists = np.linalg.norm(dae_verts[:, None, :] - expected[None, :, :], axis=2)
+        assert dists.min(axis=1).max() < 1e-6
 
         material = dae_obj.active_material
         assert material is not None

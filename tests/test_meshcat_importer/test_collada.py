@@ -135,7 +135,7 @@ class TestColladaParsing:
              [3, 1, 0], [2.5, 2, 0], [2, 1, 0]]
         )  # fmt: skip
         np.testing.assert_allclose(_corners(mesh), positions[expected_corners])
-        # No NORMAL input, so Blender computes (flat) normals, as Meshcat does.
+        # No NORMAL input: Meshcat computes flat normals, and so does the importer.
         assert mesh.corner_normals is None
         np.testing.assert_allclose(mesh.corner_uvs, [[0.25, 0.75]] * 15)
 
@@ -415,8 +415,21 @@ class TestColladaSkipped:
                 "</controller></library_controllers>",
                 '<node><instance_controller url="#morph"/></node>' + INSTANCE_TRI,
             ),
-            # And a reference to a geometry that does not exist.
+            # A reference to a geometry that does not exist.
             ("", '<node><instance_geometry url="#missing"/></node>' + INSTANCE_TRI),
+            # A material whose technique has no shader.
+            (
+                '<library_effects><effect id="e"><profile_COMMON><technique sid="t"/>'
+                "</profile_COMMON></effect></library_effects><library_materials>"
+                '<material id="m"><instance_effect url="#e"/></material>'
+                "</library_materials>",
+                INSTANCE_TRI,
+            ),
+            # A camera without <optics>.
+            (
+                '<library_cameras><camera id="c"/></library_cameras>',
+                INSTANCE_TRI,
+            ),
         ],
     )
     def test_files_meshcat_fails_on_give_empty_mesh(self, libraries, nodes):
@@ -425,3 +438,66 @@ class TestColladaSkipped:
 
         assert len(mesh.triangles) == 0
         assert any("Meshcat fails to load" in w for w in mesh.warnings)
+
+    def test_polylist_without_vcount_shows_nothing(self):
+        """ColladaLoader reads <vcount> for every polygon a <polylist> counts."""
+        geometry = POLYLIST_GEOMETRY.replace("<vcount>4 5</vcount>", "")
+        mesh = parse_collada(_collada(geometry, INSTANCE_POLY))
+
+        assert len(mesh.triangles) == 0
+        assert any("no <vcount>" in w for w in mesh.warnings)
+
+    def test_bound_material_must_exist(self):
+        """A bind_material target that is missing fails only if a primitive uses
+        the symbol."""
+        geometry = TRIANGLE_GEOMETRY.replace(
+            '<triangles count="2">', '<triangles count="2" material="skin">'
+        )
+        bound = """
+        <node>
+          <instance_geometry url="#tri-lib">
+            <bind_material><technique_common>
+              <instance_material symbol="{symbol}" target="#missing"/>
+            </technique_common></bind_material>
+          </instance_geometry>
+        </node>
+        """
+        mesh = parse_collada(_collada(geometry, bound.format(symbol="skin")))
+        assert len(mesh.triangles) == 0
+
+        mesh = parse_collada(_collada(geometry, bound.format(symbol="other")))
+        assert len(mesh.triangles) == 2
+
+    def test_doctype_shows_nothing(self):
+        """three.js mistakes <!DOCTYPE COLLADA> for the root element."""
+        document = _collada(TRIANGLE_GEOMETRY, INSTANCE_TRI).replace(
+            b"<COLLADA", b"<!DOCTYPE COLLADA>\n<COLLADA", 1
+        )
+        mesh = parse_collada(document)
+
+        assert len(mesh.triangles) == 0
+
+    @pytest.mark.parametrize(
+        "old, new",
+        [
+            ("<p>0 0 0  1 0 0", "<p>99999999999999999999 0 0  1 0 0"),
+            ("<vcount>4 5</vcount>", "<vcount>99999999999999999999 5</vcount>"),
+            ('stride="3"', 'stride="99999999999"'),
+        ],
+    )
+    def test_extreme_values_do_not_raise(self, old, new):
+        """Absurd numbers give Meshcat's result instead of an exception."""
+        geometries = (TRIANGLE_GEOMETRY + POLYLIST_GEOMETRY).replace(old, new)
+        mesh = parse_collada(_collada(geometries, INSTANCE_TRI + INSTANCE_POLY))
+
+        assert isinstance(mesh.warnings, list)
+
+    def test_infinite_rotation_draws_nothing(self):
+        """cos(Infinity) is NaN in JavaScript, so the node's vertices are NaN."""
+        nodes = (
+            '<node><rotate>0 0 1 1e400</rotate><instance_geometry url="#tri-lib"/>'
+            "</node>"
+        )
+        mesh = parse_collada(_collada(TRIANGLE_GEOMETRY, nodes))
+
+        assert len(mesh.triangles) == 0
