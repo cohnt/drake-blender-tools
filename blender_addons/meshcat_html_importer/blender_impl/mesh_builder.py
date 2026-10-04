@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 import bpy
 import numpy as np
 
-from ..scene.collada import parse_collada
 from ..scene.geometry import (
     GeometryType,
     MeshFileGeometry,
@@ -401,9 +400,15 @@ def _create_from_collada(
     Vertices stay in the file's coordinates, like the OBJ import, so the
     Meshcat transforms apply the same way to both.
     """
+    # Imported here so that the rest of the add-on works without pycollada.
+    try:
+        from ..scene.collada import parse_collada
+    except ImportError as exc:
+        print(f"Warning: Cannot read the Collada mesh for {path} ({exc}); skipping")
+        return None
     try:
         collada = parse_collada(geom.data)
-    except Exception as exc:  # A reader bug must not abort the whole import.
+    except Exception as exc:  # pycollada raises for files it cannot read.
         print(f"Warning: Reading the Collada mesh for {path} failed ({exc}); skipping")
         return None
     for message in collada.notes:

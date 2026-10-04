@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import json
 import struct
+import sys
 from pathlib import Path
 
 import pytest
@@ -394,7 +395,7 @@ class TestBlenderMeshfileImport:
         """A dae and an OBJ of the same vertices land in the same place.
 
         Both are placed by the same Meshcat transform. The dae keeps the Drake
-        Rgba as its colour, as Meshcat shows it.
+        Rgba as its color, as Meshcat shows it.
         """
         transform = Transform(
             translation=(1.0, -2.0, 0.5),
@@ -494,4 +495,35 @@ class TestBlenderMeshfileImport:
         obj, _ = create_mesh_file_object(node, name="empty")
 
         assert obj is None
-        assert "/robot/empty" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "Warning" in out
+        assert "/robot/empty" in out
+
+    def test_unreadable_dae_warns(self, capsys):
+        """A Collada file pycollada cannot read is skipped with a warning."""
+        node = SceneNode(
+            path="/robot/broken",
+            name="broken",
+            geometry=MeshFileGeometry(format="dae", data=b"<COLLADA><library_"),
+        )
+
+        obj, _ = create_mesh_file_object(node, name="broken")
+
+        assert obj is None
+        out = capsys.readouterr().out
+        assert "Warning: Reading the Collada mesh for /robot/broken failed" in out
+
+    def test_dae_without_pycollada_warns(self, capsys, monkeypatch):
+        """Without pycollada, a dae is skipped and the rest of the import runs."""
+        monkeypatch.setitem(sys.modules, "meshcat_html_importer.scene.collada", None)
+        node = SceneNode(
+            path="/robot/part",
+            name="part",
+            geometry=MeshFileGeometry(format="dae", data=b"<COLLADA></COLLADA>"),
+        )
+
+        obj, _ = create_mesh_file_object(node, name="part")
+
+        assert obj is None
+        out = capsys.readouterr().out
+        assert "Warning: Cannot read the Collada mesh for /robot/part" in out

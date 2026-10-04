@@ -181,6 +181,24 @@ class TestColladaParsing:
         assert len(mesh.triangles) == 0
         assert any("cannot merge" in w for w in mesh.warnings)
 
+    def test_missing_uvs_within_a_geometry_are_zero(self):
+        """three.js gives zero UVs to primitives without them, when other
+        primitives of the same geometry and type have UVs."""
+        geometry = POLYLIST_GEOMETRY.replace(
+            "</polylist>",
+            """</polylist>
+            <polylist count="1">
+              <input offset="0" semantic="VERTEX" source="#poly-vertices"/>
+              <vcount>3</vcount>
+              <p>4 5 8</p>
+            </polylist>""",
+        )
+        mesh = parse_collada(_collada(geometry, INSTANCE_POLY))
+
+        assert mesh.warnings == []
+        assert len(mesh.triangles) == 6
+        np.testing.assert_allclose(mesh.corner_uvs, [[0.25, 0.75]] * 15 + [[0, 0]] * 3)
+
     def test_degenerate_triangles_dropped(self):
         """Zero-area triangles draw nothing and are not kept."""
         geometry = TRIANGLE_GEOMETRY.replace(
@@ -393,6 +411,41 @@ class TestColladaSkipped:
 
         assert len(mesh.triangles) == 5
         assert any("lines" in w for w in mesh.warnings)
+
+    @pytest.mark.parametrize("kind", ["tristrips", "trifans"])
+    def test_strips_and_fans_skipped(self, kind):
+        """ColladaLoader ignores tristrips and trifans, which pycollada reads."""
+        geometry = POLYLIST_GEOMETRY.replace(
+            "</polylist>",
+            f"""</polylist>
+            <{kind} count="1">
+              <input offset="0" semantic="VERTEX" source="#poly-vertices"/>
+              <input offset="1" semantic="TEXCOORD" source="#poly-uvs" set="0"/>
+              <p>0 0 1 0 2 0 3 0</p>
+            </{kind}>""",
+        )
+        mesh = parse_collada(_collada(geometry, INSTANCE_POLY))
+
+        assert len(mesh.triangles) == 5
+        assert any(f"<{kind}>" in w for w in mesh.warnings)
+
+    def test_unreadable_geometry_reported(self):
+        """pycollada cannot read a geometry with linestrips; it is skipped and
+        the rest of the file is kept."""
+        geometry = POLYLIST_GEOMETRY.replace(
+            "</polylist>",
+            """</polylist>
+            <linestrips count="1">
+              <input offset="0" semantic="VERTEX" source="#poly-vertices"/>
+              <p>0 1 2</p>
+            </linestrips>""",
+        )
+        mesh = parse_collada(
+            _collada(TRIANGLE_GEOMETRY + geometry, INSTANCE_TRI + INSTANCE_POLY)
+        )
+
+        assert len(mesh.triangles) == 2
+        assert any("poly-lib could not be read" in w for w in mesh.warnings)
 
     def test_only_unsupported_content_gives_empty_mesh(self):
         """A file with nothing Meshcat draws yields an empty mesh and warnings."""

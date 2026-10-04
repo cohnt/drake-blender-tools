@@ -12,16 +12,20 @@ pycollada, and the result follows the same rules:
 - ``<unit>`` and ``<up_axis>`` are ignored. ColladaLoader applies them only to
   ``scene.rotation`` and ``scene.scale``, which merge_geometries never reads.
 - ``triangles`` and ``polylist`` are drawn, with polylist quads split as
-  three.js splits them. ``polygons``, lines and skinned meshes are not drawn.
+  three.js splits them. ``polygons``, ``tristrips``, ``trifans``, lines and
+  skinned meshes are not drawn.
 - Materials, textures and vertex colors are not shown, since Meshcat uses the
   material Drake sends.
 - Meshes whose attributes differ (say one with normals and one without)
-  cannot be merged, and Meshcat shows nothing.
+  cannot be merged, and Meshcat shows nothing. Within one geometry, three.js
+  gives texture coordinates of zero to the primitives that have none.
 
 Malformed or unusual files can still differ from Meshcat. For example,
 three.js transforms a geometry that is instanced more than once in place, once
 per instance, so every copy lands at the product of the transforms, whereas
-pycollada places each copy where the file says.
+pycollada places each copy where the file says. A geometry or scene that
+pycollada cannot read (say a geometry with ``linestrips``) is skipped with a
+warning, though Meshcat may draw part of it.
 """
 
 from __future__ import annotations
@@ -33,7 +37,6 @@ import collada
 import numpy as np
 from collada.asset import UP_AXIS
 from collada.common import DaeBrokenRefError, DaeUnsupportedError
-from collada.polygons import Polygons
 from collada.polylist import Polylist
 from collada.triangleset import TriangleSet
 
@@ -84,23 +87,35 @@ def parse_collada(data: bytes | str) -> ColladaMesh:
         notes.append(f"<up_axis> {asset.upaxis} is ignored, as in Meshcat")
 
     warnings = []
+    read = {geometry.id for geometry in dae.geometries}
+    for node in dae.xmlnode.iter(dae.tag("geometry")):
+        if node.find(dae.tag("mesh")) is not None and node.get("id") not in read:
+            warnings.append(f"geometry {node.get('id')} could not be read; skipped")
     if dae.scene is None:
-        return _empty_mesh(warnings + ["the file has no scene"], notes)
+        return _empty_mesh(warnings + ["the file has no scene that can be read"], notes)
     if any(True for _ in dae.scene.objects("controller")):
         warnings.append("skinned or morphed meshes are not drawn by Meshcat; skipped")
 
     pieces = []
     skipped = set()
     for bound in dae.scene.objects("geometry"):
+        # three.js builds one mesh per geometry and primitive type.
+        groups = {}
         for primitive in bound.original.primitives:
-            if isinstance(primitive, Polygons):  # Before Polylist, its base class.
-                skipped.add("<polygons>")
-            elif isinstance(primitive, (TriangleSet, Polylist)):
+            # pycollada reads tristrips and trifans as triangles; three.js skips them.
+            kind = primitive.xmlnode.tag.rpartition("}")[2]
+            if kind in ("triangles", "polylist"):
                 corners = _corners(primitive, bound.matrix)
                 if corners is not None:
-                    pieces.append(corners)
+                    groups.setdefault(kind, []).append(corners)
             else:
-                skipped.add("lines")
+                skipped.add(f"<{kind}>")
+        for group in groups.values():
+            if any(p.uvs is not None for p in group):
+                for p in group:
+                    if p.uvs is None:
+                        p.uvs = np.zeros((len(p.positions), 2))
+            pieces.extend(group)
     for kind in sorted(skipped):
         warnings.append(f"{kind} are not drawn by Meshcat; skipped")
 
@@ -185,7 +200,8 @@ def _triangle_mesh(
     if pieces[0].uvs is not None:
         uvs = np.concatenate([p.uvs for p in pieces])
 
-    # Triangles with non-finite corners draw nothing in three.js.
+    # Triangles with infinite corners draw nothing in three.js. (pycollada
+    # reads NaN as 0, whereas three.js would skip those too.)
     finite = np.repeat(np.isfinite(positions).all(axis=1).reshape(-1, 3).all(1), 3)
     positions = positions[finite]
     if len(positions) == 0:
