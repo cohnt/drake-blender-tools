@@ -15,7 +15,7 @@ with full animation support.
 - Support for multiple geometry types:
   - `BufferGeometry` (custom meshes)
   - Primitives: `BoxGeometry`, `SphereGeometry`, `CylinderGeometry`
-  - Mesh files: glTF, OBJ (embedded in `_meshfile_geometry`)
+  - Mesh files: glTF, OBJ, Collada .dae (embedded in `_meshfile_geometry`)
 - Material conversion (Three.js → Blender Principled BSDF)
 - Animation import with keyframe conversion
 - Scene hierarchy preservation
@@ -49,7 +49,9 @@ meshcat-html-import recording.meshcat -o scene.blend
 
 ### As a Blender Addon
 
-Install the `meshcat_html_importer` extension from `blender_addons/`:
+Install the `meshcat_html_importer` extension from `blender_addons/`. It
+bundles pycollada as wheels, so download those first with
+`make addon-wheels`:
 
 1. In Blender: Edit > Preferences > Get Extensions
 2. Install from disk: select `blender_addons/meshcat_html_importer/`
@@ -95,4 +97,6 @@ Meshcat HTML recordings contain:
 ### Geometry
 - Positions, normals, UVs, and indices from BufferGeometry
 - Procedural primitives (box, sphere, cylinder)
-- Embedded glTF/OBJ mesh files
+- Embedded glTF/OBJ/Collada mesh files
+- Collada (.dae) meshes are read with pycollada and imported as Meshcat shows
+  them (see the `scene/collada.py` docstring)

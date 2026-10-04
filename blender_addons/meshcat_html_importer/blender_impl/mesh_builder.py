@@ -46,7 +46,7 @@ def create_mesh_object(
     elif isinstance(node.geometry, PrimitiveGeometry):
         return _create_from_primitive(node.geometry, obj_name)
     elif isinstance(node.geometry, MeshFileGeometry):
-        result = _create_from_mesh_file(node.geometry, obj_name)
+        result = _create_from_mesh_file(node.geometry, obj_name, node.path)
         # _create_from_mesh_file returns (obj, import_matrix) tuple
         return result[0] if result[0] is not None else None
 
@@ -75,7 +75,7 @@ def create_mesh_file_object(
         return None, None
 
     obj_name = name or node.name
-    return _create_from_mesh_file(node.geometry, obj_name)
+    return _create_from_mesh_file(node.geometry, obj_name, node.path)
 
 
 def _create_from_mesh_geometry(
@@ -305,20 +305,38 @@ def _create_plane_mesh(
 def _create_from_mesh_file(
     geom: MeshFileGeometry,
     name: str,
+    path: str,
 ) -> tuple[bpy.types.Object, "mathutils.Matrix"] | tuple[None, None]:
     """Create mesh by importing embedded mesh file.
+
+    Args:
+        geom: Embedded mesh file
+        name: Name for the created object
+        path: Meshcat path of the object, used in warnings
 
     Returns:
         Tuple of (object, import_matrix) where import_matrix is Blender's static
         glTF import transform (axis conversion plus any embedded node transforms).
-        For OBJ imports, import_matrix is None. Returns (None, None) on failure.
+        For OBJ and Collada meshes, import_matrix is None. Returns (None, None) on
+        failure, after printing a warning.
     """
+    fmt = geom.format.lower()
+
+    if fmt == "dae":
+        return _create_from_collada(geom, name, path), None
+
+    if fmt not in ("gltf", "glb", "obj"):
+        print(
+            f"Warning: Unsupported embedded mesh format '{geom.format}' "
+            f"for {path}; skipping"
+        )
+        return None, None
 
     # Write mesh data to temp file
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
 
-        if geom.format.lower() in ("gltf", "glb"):
+        if fmt in ("gltf", "glb"):
             # Determine extension
             ext = ".glb" if geom.data[:4] == b"glTF" else ".gltf"
             mesh_file = temp_path / f"{name}{ext}"
@@ -344,7 +362,7 @@ def _create_from_mesh_file(
                     _pack_images_for_object(main_obj)
                     return main_obj, main_obj.matrix_world.copy()
 
-        elif geom.format.lower() == "obj":
+        elif fmt == "obj":
             mesh_file = temp_path / f"{name}.obj"
             mesh_file.write_bytes(geom.data)
 
@@ -364,9 +382,73 @@ def _create_from_mesh_file(
                 main_obj = _select_main_object_and_cleanup(new_objects, name)
                 if main_obj is not None:
                     _pack_images_for_object(main_obj)
-                return main_obj, None
+                    return main_obj, None
 
+    print(f"Warning: Importing the embedded {fmt} mesh for {path} failed; skipping")
     return None, None
+
+
+def _create_from_collada(
+    geom: MeshFileGeometry,
+    name: str,
+    path: str,
+) -> bpy.types.Object | None:
+    """Build a mesh object from an embedded Collada (.dae) file.
+
+    Blender has no Collada importer, so the file is read by
+    ``scene.collada.parse_collada``, which keeps what Meshcat draws.
+    Vertices stay in the file's coordinates, like the OBJ import, so the
+    Meshcat transforms apply the same way to both.
+    """
+    # Imported here so that the rest of the add-on works without pycollada.
+    try:
+        from ..scene.collada import parse_collada
+    except ImportError as exc:
+        print(f"Warning: Cannot read the Collada mesh for {path} ({exc}); skipping")
+        return None
+    try:
+        collada = parse_collada(geom.data)
+    except Exception as exc:  # pycollada raises for files it cannot read.
+        print(f"Warning: Reading the Collada mesh for {path} failed ({exc}); skipping")
+        return None
+    for message in collada.notes:
+        print(f"Note: Collada mesh for {path}: {message}")
+    for message in collada.warnings:
+        print(f"Warning: Collada mesh for {path}: {message}")
+
+    num_triangles = len(collada.triangles)
+    if num_triangles == 0:
+        print(f"Warning: Collada mesh for {path} has no drawable geometry; skipping")
+        return None
+
+    # The triangles are not validated: they are well formed by construction, and
+    # mesh.validate() would merge faces that share vertices, such as the two
+    # sides of a double-sided surface, which Meshcat draws separately.
+    mesh = bpy.data.meshes.new(name)
+    mesh.vertices.add(len(collada.positions))
+    mesh.vertices.foreach_set("co", collada.positions.astype(np.float32).ravel())
+    mesh.loops.add(3 * num_triangles)
+    mesh.loops.foreach_set("vertex_index", collada.triangles.astype(np.int32).ravel())
+    mesh.polygons.add(num_triangles)
+    mesh.polygons.foreach_set(
+        "loop_start", np.arange(0, 3 * num_triangles, 3, dtype=np.int32)
+    )
+    mesh.update(calc_edges=True)
+
+    # Corner data is in triangle order, which is the loop order.
+    if collada.corner_uvs is not None:
+        uv_layer = mesh.uv_layers.new(name="UVMap")
+        uv_layer.data.foreach_set("uv", collada.corner_uvs.astype(np.float32).ravel())
+
+    if collada.corner_normals is not None:
+        mesh.shade_smooth()
+        mesh.normals_split_custom_set(collada.corner_normals.astype(np.float32))
+    else:
+        # Meshcat computes flat normals for a mesh without them.
+        mesh.shade_flat()
+
+    mesh.update()
+    return bpy.data.objects.new(name, mesh)
 
 
 def _pack_images_for_object(obj: bpy.types.Object) -> None:
