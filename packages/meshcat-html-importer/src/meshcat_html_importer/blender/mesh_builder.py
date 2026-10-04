@@ -397,7 +397,7 @@ def _create_from_collada(
     """Build a mesh object from an embedded Collada (.dae) file.
 
     Blender has no Collada importer, so the file is read by
-    ``scene.collada.parse_collada``, which keeps exactly what Meshcat draws.
+    ``scene.collada.parse_collada``, which keeps what Meshcat draws.
     Vertices stay in the file's coordinates, like the OBJ import, so the
     Meshcat transforms apply the same way to both.
     """

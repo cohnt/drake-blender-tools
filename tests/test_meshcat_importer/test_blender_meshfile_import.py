@@ -154,7 +154,10 @@ def _make_collada_geometry(
         <source id="pos">
           <float_array id="pos-array" count="12">{positions}</float_array>
           <technique_common>
-            <accessor source="#pos-array" stride="3"/>
+            <accessor source="#pos-array" stride="3">
+              <param name="X" type="float"/><param name="Y" type="float"/>
+              <param name="Z" type="float"/>
+            </accessor>
           </technique_common>
         </source>
         <source id="nrm">
@@ -162,7 +165,10 @@ def _make_collada_geometry(
             0 0 -1  0 -1 0  -1 0 0  0.57735 0.57735 0.57735
           </float_array>
           <technique_common>
-            <accessor source="#nrm-array" stride="3"/>
+            <accessor source="#nrm-array" stride="3">
+              <param name="X" type="float"/><param name="Y" type="float"/>
+              <param name="Z" type="float"/>
+            </accessor>
           </technique_common>
         </source>
         <vertices id="verts"><input semantic="POSITION" source="#pos"/></vertices>
@@ -307,19 +313,27 @@ class TestBlenderMeshfileImport:
         <source id="pos">
           <float_array id="pos-array">0 0 0  1 0 0  0 1 0</float_array>
           <technique_common>
-            <accessor source="#pos-array" stride="3"/>
+            <accessor source="#pos-array" stride="3">
+              <param name="X" type="float"/><param name="Y" type="float"/>
+              <param name="Z" type="float"/>
+            </accessor>
           </technique_common>
         </source>
         <source id="nrm">
           <float_array id="nrm-array">{flat}</float_array>
           <technique_common>
-            <accessor source="#nrm-array" stride="3"/>
+            <accessor source="#nrm-array" stride="3">
+              <param name="X" type="float"/><param name="Y" type="float"/>
+              <param name="Z" type="float"/>
+            </accessor>
           </technique_common>
         </source>
         <source id="uv">
           <float_array id="uv-array">{flat_uvs}</float_array>
           <technique_common>
-            <accessor source="#uv-array" stride="2"/>
+            <accessor source="#uv-array" stride="2">
+              <param name="S" type="float"/><param name="T" type="float"/>
+            </accessor>
           </technique_common>
         </source>
         <vertices id="verts"><input semantic="POSITION" source="#pos"/></vertices>

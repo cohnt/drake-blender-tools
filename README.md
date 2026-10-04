@@ -82,7 +82,10 @@ The addon source lives in `packages/meshcat-html-importer/src/` and is synced to
 # Sync package code to addon and convert imports
 make sync-addon
 
-# Build addon zip for distribution
+# Download the third-party wheels the addon bundles (pycollada)
+make addon-wheels
+
+# Build addon zip for distribution (includes the wheels)
 make build-addon
 ```
 

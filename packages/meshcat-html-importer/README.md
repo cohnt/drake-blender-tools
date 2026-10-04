@@ -49,7 +49,9 @@ meshcat-html-import recording.meshcat -o scene.blend
 
 ### As a Blender Addon
 
-Install the `meshcat_html_importer` extension from `blender_addons/`:
+Install the `meshcat_html_importer` extension from `blender_addons/`. It
+bundles pycollada as wheels, so download those first with
+`make addon-wheels`:
 
 1. In Blender: Edit > Preferences > Get Extensions
 2. Install from disk: select `blender_addons/meshcat_html_importer/`
@@ -96,5 +98,5 @@ Meshcat HTML recordings contain:
 - Positions, normals, UVs, and indices from BufferGeometry
 - Procedural primitives (box, sphere, cylinder)
 - Embedded glTF/OBJ/Collada mesh files
-- Collada (.dae) meshes are imported exactly as Meshcat shows them (see the
-  `scene/collada.py` docstring)
+- Collada (.dae) meshes are read with pycollada and imported as Meshcat shows
+  them (see the `scene/collada.py` docstring)

@@ -1,7 +1,10 @@
-.PHONY: sync-addon build-addon test clean
+.PHONY: sync-addon addon-wheels build-addon test clean
 
 ADDON_DIR := blender_addons/meshcat_html_importer
 PKG_SRC := packages/meshcat-html-importer/src/meshcat_html_importer
+# Third-party wheels bundled with the addon, which Blender installs with it.
+# Keep in step with the `wheels` list in blender_manifest.toml.
+ADDON_WHEELS := pycollada==0.9.3 python-dateutil==2.9.0.post0 six==1.17.0
 
 # Sync package code to addon directory.
 # Copies subpackages (parser, scene, animation, blender) into the addon and
@@ -29,8 +32,13 @@ sync-addon:
 	@# Remove fallback 'import msgpack' lines (only in try/except blocks)
 	@echo "Done. Addon synced."
 
+# Download the wheels listed in the addon manifest
+addon-wheels:
+	rm -rf $(ADDON_DIR)/wheels
+	python3 -m pip download --only-binary=:all: --no-deps --dest $(ADDON_DIR)/wheels $(ADDON_WHEELS)
+
 # Build addon zip for distribution
-build-addon: sync-addon
+build-addon: sync-addon addon-wheels
 	@echo "Building addon zip..."
 	cd $(ADDON_DIR) && zip -r ../../meshcat_html_importer.zip . -x '*/__pycache__/*'
 	@echo "Created meshcat_html_importer.zip"
@@ -42,3 +50,4 @@ test:
 # Clean build artifacts
 clean:
 	rm -f meshcat_html_importer.zip
+	rm -rf $(ADDON_DIR)/wheels

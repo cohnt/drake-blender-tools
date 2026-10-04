@@ -9,6 +9,13 @@ maintainer = "Nicholas Pfaff <nepfaff@mit.edu>"
 type = "add-on"
 blender_version_min = "5.0.0"
 
+# Downloaded by `make addon-wheels` (pinned in the Makefile).
+wheels = [
+  "./wheels/pycollada-0.9.3-py3-none-any.whl",
+  "./wheels/python_dateutil-2.9.0.post0-py2.py3-none-any.whl",
+  "./wheels/six-1.17.0-py2.py3-none-any.whl",
+]
+
 license = ["SPDX:BSD-2-Clause"]
 copyright = ["2024 Nicholas Pfaff"]
 
